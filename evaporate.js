@@ -14,7 +14,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 /***************************************************************************************************
 *                                                                                                  *
-*  version 0.0.9                                                                                  *
+*  version 0.1.0                                                                                  *
 *                                                                                                  *
 *  TODO:                                                                                           *
 *       post eTags to application server to allow resumability after client-side crash/restart      *
