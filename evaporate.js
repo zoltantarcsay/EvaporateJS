@@ -61,7 +61,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
      }
 
      var _d = new Date(),
-         HOURS_AGO = new Date(_d.setHours(_d.getHours() - (con.d3FileCacheHoursAgo || -100)));
+         HOURS_AGO = new Date(_d.setHours(_d.getHours() - (con.s3FileCacheHoursAgo || -100)));
 
      //con.simulateStalling =  true
 
@@ -74,8 +74,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         }
         if (typeof file.name == 'undefined'){
            err = 'Missing attribute: name  ';
-        }
-        else if(con.encodeFilename) {
+        } else if(con.encodeFilename) {
            file.name = encodeURIComponent(file.name); // prevent signature fail in case file name has spaces 
         }       
         
@@ -770,21 +769,22 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         }
 
         function createUploadFile() {
-           var newUpload = {
-              awsKey: me.name,
-              uploadId: me.uploadId,
-              fileSize: me.file.size,
-              fileType: me.file.type,
-              lastModifiedDate: me.file.lastModifiedDate.toISOString(),
-              partSize: con.partSize,
-              createdAt: new Date().toISOString()
-           };
-           saveUpload(me.file.name, newUpload);
+           var fileKey = uploadKey(me),
+               newUpload = {
+                 awsKey: me.name,
+                 uploadId: me.uploadId,
+                 fileSize: me.file.size,
+                 fileType: me.file.type,
+                 lastModifiedDate: me.file.lastModifiedDate.toISOString(),
+                 partSize: con.partSize,
+                 createdAt: new Date().toISOString()
+              };
+           saveUpload(fileKey, newUpload);
         }
 
         function completeUploadFile() {
            var uploads = getSavedUploads(),
-               upload = uploads[me.file.name];
+               upload = uploads[uploadKey(me)];
            upload.completedAt = new Date().toISOString();
            upload.eTag = me.eTag;
            localStorage.setItem('awsUploads', JSON.stringify(uploads));
@@ -796,13 +796,13 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
         function removeUploadFile() {
            if (typeof me.file !== 'undefined') {
-              removeUpload(me.file.name);
+              removeUpload(uploadKey(me));
            }
         }
 
         function getUnfinishedFileUpload() {
            var savedUploads = getSavedUploads(true),
-               u = savedUploads[me.file.name];
+               u = savedUploads[uploadKey(me)];
 
            if (canRetryUpload(u)) {
               me.uploadId = u.uploadId;
@@ -818,11 +818,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
            }
            var completedAt = new Date(u.completedAt || FAR_FUTURE);
 
-           return u.fileSize === me.file.size &&
-               u.lastModifiedDate === me.file.lastModifiedDate.toISOString() &&
-               u.fileType === me.file.type &&
-               con.partSize === u.partSize,
-               completedAt > HOURS_AGO;
+           return con.partSize === u.partSize && completedAt > HOURS_AGO;
         }
 
         function backOffWait(attempts) {
@@ -1217,15 +1213,26 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         return result;
      }
 
-     function saveUpload(filename, upload) {
+     function uploadKey(fileUpload) {
+        // The key tries to give a signature to a file in the absence of its path.
+        // "<filename>-<mimetype>-<modifieddate>-<filesize>"
+        return [
+           fileUpload.file.name,
+           fileUpload.file.type,
+           fileUpload.file.lastModifiedDate.toISOString(),
+           fileUpload.file.size
+        ].join("-");
+     }
+
+     function saveUpload(uploadKey, upload) {
         var uploads = getSavedUploads();
-        uploads[filename] = upload;
+        uploads[uploadKey] = upload;
         localStorage.setItem('awsUploads', JSON.stringify(uploads));
      }
 
-     function removeUpload(filename) {
+     function removeUpload(uploadKey) {
         var uploads = getSavedUploads();
-        delete uploads[filename];
+        delete uploads[uploadKey];
         localStorage.setItem('awsUploads', JSON.stringify(uploads));
      }
 
