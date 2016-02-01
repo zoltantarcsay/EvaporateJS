@@ -232,8 +232,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 
         function setStatus(s){
-           if (s == COMPLETE || s == ERROR || s == CANCELED){
-              me.progress(1.0);
+           if (s === COMPLETE || s === ERROR || s === CANCELED) {
               clearInterval(progressTotalInterval);
               clearInterval(progressPartsInterval);
            }
@@ -543,6 +542,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
               if (eTag === me.eTag) {
                  l.d('headObject found matching object on S3.');
                  setStatus(COMPLETE);
+                 me.progress(1.0);
               } else {
                  l.d('headObject not found on S3.');
                  me.name = awsKey;
@@ -788,6 +788,8 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
            localStorage.setItem('awsUploads', JSON.stringify(uploads));
 
            setStatus(COMPLETE);
+           me.progress(1.0);
+
         }
 
         function removeUploadFile() {
