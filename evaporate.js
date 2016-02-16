@@ -563,7 +563,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
            authorizedSend(head_object);
         }
 
-        var numProcessed = 0,
+        var numDigestsProcessed = 0,
             numParts = -1;
 
         function computePartMd5Digest(part) {
@@ -584,11 +584,11 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
               delete part.reader; // release potentially large memory allocation
 
-              numProcessed += 1;
+              numDigestsProcessed += 1;
 
               processPartsList();
 
-              if (numProcessed === numParts) {
+              if (numDigestsProcessed === numParts) {
                  l.d('All parts have MD5 digests');
               }
 
