@@ -1163,8 +1163,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         }
 
         function assignCurrentXhr(requester) {
-           var xhr = getBaseXhrObject(requester).currentXhr =  new XMLHttpRequest();
-           return xhr;
+           return getBaseXhrObject(requester).currentXhr =  new XMLHttpRequest();
         }
 
         function clearCurrentXhr(requester) {
