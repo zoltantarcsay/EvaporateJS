@@ -14,16 +14,13 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 /***************************************************************************************************
 *                                                                                                  *
-*  version 0.0.2                                                                                  *
-*                                                                                                  *
-*  TODO:                                                                                           *
-*       calculate MD5s and send with PUTs                                                          *
-*       post eTags to application server to allow resumability after client-side crash/restart      *
+*  version 1.0.6                                                                                   *
 *                                                                                                  *
 *                                                                                                  *
 ***************************************************************************************************/
 
 (function() {
+   var FAR_FUTURE = new Date('2060-10-22');
 
   var Evaporate = function(config){
 
@@ -51,9 +48,20 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         maxRetryBackoffSecs: 300,
         progressIntervalMS: 500,
         cloudfront: false,
-        encodeFilename: true
+        encodeFilename: true,
+        computeContentMd5: false,
+        s3FileCacheHoursAgo: null // Must be a whole number of hours. Will be interpreted as negative (hours in the past).
 
      }, config);
+     if (con.computeContentMd5) {
+        if (typeof con.cryptoMd5Method !== 'function') {
+           alert('Option computeContentMd5 has been set but cryptoMd5Method is not defined.');
+           return;
+        }
+     }
+
+     var _d = new Date(),
+         HOURS_AGO = new Date(_d.setHours(_d.getHours() - (con.s3FileCacheHoursAgo || -100)));
 
      //con.simulateStalling =  true
 
@@ -66,8 +74,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         }
         if (typeof file.name == 'undefined'){
            err = 'Missing attribute: name  ';
-        }
-        else if(con.encodeFilename) {
+        } else if(con.encodeFilename) {
            file.name = encodeURIComponent(file.name); // prevent signature fail in case file name has spaces 
         }       
         
@@ -143,7 +150,8 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
            priority: 0,
            onStatusChange: onFileUploadStatusChange,
            loadedBytes: 0,
-           sizeBytes: file.file.size
+           sizeBytes: file.file.size,
+           eTag: ''
         })));
         return id;
      }
@@ -186,7 +194,8 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
      function FileUpload(file){
 
-        var me = this, parts = [], progressTotalInterval, progressPartsInterval, countUploadAttempts = 0, xhrs = [];
+        var me = this, parts = [], completedParts = [], progressTotalInterval, progressPartsInterval, countUploadAttempts = 0,
+            countInitiateAttempts = 0, countCompleteAttempts = 0;
         extend(me,file);
 
         me.start = function(){
@@ -194,23 +203,44 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
            l.d('starting FileUpload ' + me.id);
 
            setStatus(EVAPORATING);
-           initiateUpload();
-           monitorTotalProgress();
-           monitorPartsProgress();
+
+           var awsKey = me.name;
+
+           getUnfinishedFileUpload();
+
+           if (typeof me.uploadId === 'undefined') {
+              initiateUpload(awsKey);
+           } else {
+              if (typeof me.eTag === 'undefined' || !me.firstMd5Digest) {
+                 getUploadParts(0);
+              } else {
+                 var reader = new FileReader();
+                 reader.onloadend = function () {
+                    var md5_digest = con.cryptoMd5Method.call(this, this.result);
+                    if (me.firstMd5Digest === md5_digest) {
+                       headObject(awsKey);
+                    } else {
+                       me.firstMd5Digest = md5_digest; // let's store the digest to avoid having to calculate it again
+                       initiateUpload(awsKey);
+                    }
+                 };
+                 reader.readAsBinaryString(getFilePart(me.file, 0, con.partSize));
+              }
+           }
         };
 
         me.stop = function(){
 
            l.d('stopping FileUpload ', me.id);
            me.cancelled();
-           me.info('upload canceled');
            setStatus(CANCELED);
+           me.info('Canceling uploads...');
            cancelAllRequests();
         };
 
 
         function setStatus(s){
-           if (s == COMPLETE || s == ERROR || s == CANCELED){
+           if (s === COMPLETE || s === ERROR || s === CANCELED) {
               clearInterval(progressTotalInterval);
               clearInterval(progressPartsInterval);
            }
@@ -222,13 +252,24 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         function cancelAllRequests(){
            l.d('cancelAllRequests()');
 
-           xhrs.forEach(function(xhr,i){
-              xhr.abort();
-           });
+           for (var i = 1; i < parts.length; i++) {
+              abortPart(i, true);
+           }
+
+           abortUpload();
         }
 
 
-        function initiateUpload(){ // see: http://docs.amazonwebservices.com/AmazonS3/latest/API/mpUploadInitiate.html
+        function processFileParts() {
+           if (con.computeContentMd5 && me.file.size > 0) {
+              processPartsListWithMd5Digests();
+           } else {
+              createUploadFile();
+              processPartsList();
+           }
+        }
+
+        function initiateUpload(awsKey) { // see: http://docs.amazonwebservices.com/AmazonS3/latest/API/mpUploadInitiate.html
 
            var initiate = {
               method: 'POST',
@@ -236,15 +277,33 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
               step: 'initiate',
               x_amz_headers: me.xAmzHeadersAtInitiate,
               not_signed_headers: me.notSignedHeadersAtInitiate
-           };
+              },
+              originalStatus = me.status,
+              hasErrored;
 
            if (me.contentType){
               initiate.contentType = me.contentType;
            }
 
-           initiate.onErr = function(xhr){
+           initiate.onErr = function (xhr){
+              if (hasErrored || me.status === ABORTED || me.status === CANCELED) {
+                 return;
+              }
+
+              hasErrored = true;
+
               l.d('onInitiateError for FileUpload ' + me.id);
+              me.warn('Error initiating upload');
               setStatus(ERROR);
+
+              xhr.abort();
+
+              setTimeout(function () {
+                 if (me.status !== ABORTED && me.status !== CANCELED) {
+                    me.status = originalStatus;
+                    initiateUpload(awsKey);
+                 }
+              }, backOffWait(countInitiateAttempts++));
            };
 
            initiate.on200 = function(xhr){
@@ -252,9 +311,10 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
               var match = xhr.response.match(/<UploadId\>(.+)<\/UploadId\>/);
               if (match && match[1]){
                  me.uploadId = match[1];
+                 me.awsKey = awsKey;
                  l.d('requester success. got uploadId ' + me.uploadId);
                  makeParts();
-                 processPartsList();
+                 processFileParts();
               }else{
                  initiate.onErr();
               }
@@ -262,6 +322,8 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
            setupRequest(initiate);
            authorizedSend(initiate);
+
+           monitorProgress();
         }
 
 
@@ -275,22 +337,35 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
            countUploadAttempts++;
            part.loadedBytesPrevious = null;
 
-           backOff = part.attempts++ === 0 ? 0 : 1000 * Math.min(
-              con.maxRetryBackoffSecs,
-              Math.pow(con.retryBackoffPower,part.attempts-2)
-           );
+           backOff = backOffWait(part.attempts++);
            l.d('uploadPart #' + partNumber + '     will wait ' + backOff + 'ms to try');
+
+           function getAwsResponse(xhr) {
+              var oParser = new DOMParser(),
+                  oDOM = oParser.parseFromString(xhr.responseText, "text/xml"),
+                  code = oDOM.getElementsByTagName("Code"),
+                  msg = oDOM.getElementsByTagName("Message");
+              code = code.length ? code[0].innerHTML : '';
+              msg = msg.length ? msg[0].innerHTML : '';
+
+              return code.length ? {code: code, msg: msg} : {};
+           }
 
            upload = {
               method: 'PUT',
               path: getPath() + '?partNumber='+partNumber+'&uploadId='+me.uploadId,
               step: 'upload #' + partNumber,
               x_amz_headers: me.xAmzHeadersAtUpload,
-              attempts: part.attempts
+              md5_digest: part.md5_digest,
+              attempts: part.attempts,
+              part: part
            };
-           // TODO: add md5
 
            upload.onErr = function (xhr, isOnError){
+
+              if (me.status === CANCELED) {
+                 return;
+              }
 
               var msg = 'problem uploading part #' + partNumber + ',   http status: ' + xhr.status +
               ',   hasErrored: ' + !!hasErrored + ',   part status: ' + part.status +
@@ -308,16 +383,19 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
                   var errMsg = '404 error resulted in abortion of both this part and the entire file.';
                   l.w(errMsg + ' Server response: ' + xhr.response);
                   me.error(errMsg);
-                  // TODO: kill off other uploading parts when file is aborted
                   part.status = ABORTED;
-                  setStatus(ABORTED);
+                  abortUpload();
               } else {
                  part.status = ERROR;
                  part.loadedBytes = 0;
+
+                 awsResponse = getAwsResponse(xhr);
+                 if (awsResponse.code) {
+                    l.e('AWS Server response: code="' + awsResponse.code + '", message="' + awsResponse.msg + '"');
+                 }
                  processPartsList();
               }
               xhr.abort();
-              // TODO: does AWS have other error codes that we can handle?
            };
 
            upload.on200 = function (xhr){
@@ -344,12 +422,9 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
               part.loadedBytes = evt.loaded;
            };
 
-           var slicerFn = (me.file.slice ? 'slice' : (me.file.mozSlice ? 'mozSlice' : 'webkitSlice'));
-           // browsers' implementation of the Blob.slice function has been renamed a couple of times, and the meaning of the 2nd parameter changed. For example Gecko went from slice(start,length) -> mozSlice(start, end) -> slice(start, end). As of 12/12/12, it seems that the unified 'slice' is the best bet, hence it being first in the list. See https://developer.mozilla.org/en-US/docs/DOM/Blob for more info.
-
            upload.toSend = function() {
-              var slice= me.file[slicerFn](part.start, part.end);
-              l.d('sending part # ' + partNumber + ' (bytes ' + part.start + ' -> ' + part.end + ')  reported length: ' + slice.size);
+              var slice = getFilePart(me.file, part.start, part.end);
+              l.d('part # ' + partNumber + ' (bytes ' + part.start + ' -> ' + part.end + ')  reported length: ' + slice.size);
               if(!part.isEmpty && slice.size === 0) // issue #58
               {
                  l.w('  *** WARN: blob reporting size of 0 bytes. Will try upload anyway..');
@@ -369,26 +444,27 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
            setupRequest(upload);
 
-           setTimeout(function(){
-              authorizedSend(upload);
-              l.d('upload #',partNumber,upload);
-           },backOff);
+           setTimeout(function () {
+              if (me.status !== ABORTED && me.status !== CANCELED) {
+                 authorizedSend(upload);
+                 l.d('upload #', partNumber, upload);
+              }
+           }, backOff);
 
            part.uploader = upload;
         }
 
-
-        function abortPart(partNumber){
+        function abortPart(partNumber, clearReadyStateCallback){
 
            var part = parts[partNumber];
-
-           if (part.uploader.awsXhr){
-              part.uploader.awsXhr.abort();
-           }
-           if (part.uploader.authXhr){
-              part.uploader.authXhr.abort();
+           if (part.currentXhr) {
+              if (!!clearReadyStateCallback) {
+                 part.currentXhr.onreadystatechange = function () {};
+              }
+              part.currentXhr.abort();
            }
         }
+
 
 
         function completeUpload(){ //http://docs.amazonwebservices.com/AmazonS3/latest/API/mpUploadComplete.html
@@ -396,7 +472,9 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
            l.d('completeUpload');
            me.info('will attempt to complete upload');
 
-           var completeDoc = '<CompleteMultipartUpload>';
+           var completeDoc = '<CompleteMultipartUpload>',
+               originalStatus = me.status,
+               hasErrored;
            parts.forEach(function(part,partNumber){
               if (part){
                  completeDoc += '<Part><PartNumber>' + partNumber + '</PartNumber><ETag>' + part.eTag + '</ETag></Part>';
@@ -412,16 +490,35 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
               step: 'complete'
            };
 
-           complete.onErr = function (){
+           complete.onErr = function (xhr) {
+              if (hasErrored || me.status === ABORTED || me.status === CANCELED) {
+                  return;
+              }
+
+              hasErrored = true;
+
               var msg = 'Error completing upload.';
               l.w(msg);
               me.error(msg);
               setStatus(ERROR);
+
+              xhr.abort();
+
+              setTimeout(function () {
+                 if (me.status !== ABORTED && me.status !== CANCELED) {
+                    me.status = originalStatus;
+                    completeUpload();
+                    monitorProgress();
+                 }
+              }, backOffWait(countCompleteAttempts++));
            };
 
            complete.on200 = function(xhr){
-              me.complete(xhr);
-              setStatus(COMPLETE);
+              var oDOM = parseXml(xhr.responseText),
+                  result = oDOM.getElementsByTagName("CompleteMultipartUploadResult")[0];
+              me.eTag = nodeValue(result, "ETag");
+              me.complete(xhr, me.name);
+              completeUploadFile();
            };
 
            complete.toSend = function() {
@@ -432,24 +529,325 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
            authorizedSend(complete);
         }
 
+        function headObject(awsKey){ //http://docs.amazonwebservices.com/AmazonS3/latest/API/mpUploadComplete.html
 
-        function makeParts(){
+           l.d('headObject');
+           me.info('will attempt to verify existence of the file');
 
-           var numParts = Math.ceil(me.file.size / con.partSize) || 1; // issue #58
-           for (var part = 1; part <= numParts; part++){
+           var head_object = {
+              method: 'HEAD',
+              path: getPath(),
+              step: 'head_object'
+           };
 
-              parts[part] = {
-                 status: PENDING,
-                 start: (part-1)*con.partSize,
-                 end: (part*con.partSize),
-                 attempts: 0,
-                 loadedBytes: 0,
-                 loadedBytesPrevious: null,
-                 isEmpty: (me.file.size === 0) // issue #58
-              };
+           head_object.onErr = function (){
+              var msg = 'Error completing head object. Will re-upload file.';
+              l.w(msg);
+              initiateUpload(awsKey);
+           };
+
+           head_object.on200 = function(xhr){
+              var eTag = xhr.getResponseHeader('Etag');
+              if (eTag === me.eTag) {
+                 l.d('headObject found matching object on S3.');
+                 me.complete(xhr, me.name);
+                 setStatus(COMPLETE);
+                 me.progress(1.0);
+              } else {
+                 l.d('headObject not found on S3.');
+                 me.name = awsKey;
+                 initiateUpload(awsKey);
+              }
+           };
+
+           setupRequest(head_object);
+           authorizedSend(head_object);
+        }
+
+        var numDigestsProcessed = 0,
+            numParts = -1;
+
+        function computePartMd5Digest(part) {
+           return function () {
+              var s = me.status;
+              if (s == ERROR || s == CANCELED) {
+                 return;
+              }
+
+              var md5_digest = con.cryptoMd5Method.call(this, this.result);
+
+              l.d(['part #', part.part, ' MD5 digest is ', md5_digest].join(''));
+              part.md5_digest = md5_digest;
+
+              if (part.part === 1) {
+                 createUploadFile();
+              }
+
+              delete part.reader; // release potentially large memory allocation
+
+              numDigestsProcessed += 1;
+
+              processPartsList();
+
+              if (numDigestsProcessed === numParts) {
+                 l.d('All parts have MD5 digests');
+              }
+
+              setTimeout(processPartsListWithMd5Digests, 1500);
            }
         }
 
+        function processPartsListWithMd5Digests() {
+           // We need the request body to compute the MD5 checksum but the body is only available
+           // as a FileReader object whose value is fetched asynchronously.
+
+           // This method delays submitting the part for upload until its MD5 digest is ready
+           for (var i = 1; i <= numParts; i++) {
+              var part = parts[i];
+              if (part.status !== COMPLETE && part.md5_digest === null) {
+                 if (i > 1 || typeof me.firstMd5Digest === 'undefined') {
+                    part.reader = new FileReader();
+                    part.reader.onloadend = computePartMd5Digest(part);
+                    part.reader.readAsBinaryString(getFilePart(me.file, part.start, part.end));
+                    break;
+                 } else { // We already calculated the first part's md5_digest
+                    part.md5_digest = me.firstMd5Digest;
+                    createUploadFile();
+                    processPartsList();
+                 }
+              }
+           }
+        }
+
+        function abortUpload() { //http://docs.amazonwebservices.com/AmazonS3/latest/API/mpUploadAbort.html
+
+           l.d('abortUpload');
+           me.info('will attempt to abort the upload');
+
+           var abort = {
+              method: 'DELETE',
+              path: getPath() + '?uploadId=' + me.uploadId,
+              step: 'abort',
+              successStatus: 204
+           };
+
+           abort.onErr = function () {
+              var msg = 'Error aborting upload.';
+              l.w(msg);
+              me.error(msg);
+           };
+
+           abort.on200 = function () {
+              setStatus(ABORTED);
+              checkForParts();
+           };
+
+           setupRequest(abort);
+           authorizedSend(abort);
+        }
+
+        function checkForParts() { //http://docs.amazonwebservices.com/AmazonS3/latest/API/mpUploadListParts.html
+
+           l.d('listParts');
+           me.info('list parts');
+
+           var list = {
+              method: 'GET',
+              path: getPath() + '?uploadId=' + me.uploadId,
+              step: 'list'
+           };
+
+           list.onErr = function (xhr) {
+              if (xhr.status == 404) {
+                 // Success! Parts are not found because the uploadid has been cleared
+                 removeUploadFile();
+                 me.info('upload canceled');
+              } else {
+                 var msg = 'Error listing parts.';
+                 l.w(msg);
+                 me.error(msg);
+              }
+           };
+
+           list.on200 = function (xhr) {
+              var oDOM = parseXml(xhr.responseText);
+              var parts = oDOM.getElementsByTagName("Part");
+              if (parts.length) { // Some parts are still uploading
+                 l.d('Parts still found after abort...waiting.')
+                 setTimeout(function () { abortUpload(); }, 1000);
+              } else {
+                 me.info('upload canceled');
+              }
+           };
+
+           setupRequest(list);
+           authorizedSend(list);
+        }
+
+
+        function getUploadParts(partNumberMarker) { //http://docs.amazonwebservices.com/AmazonS3/latest/API/mpUploadListParts.html
+
+           l.d('getUploadParts() for uploadId starting at part # ' + partNumberMarker);
+           me.info('getUploadParts() for uploadId starting at part # ' + partNumberMarker);
+
+           var list = {
+              method: 'GET',
+              path: getPath() + '?uploadId=' + me.uploadId,
+              query_string: "&part-number-marker=" + partNumberMarker,
+              step: 'get upload parts'
+           };
+
+           list.onErr = function (xhr) {
+              if (xhr.status === 404) {
+                 // Success! Upload is no longer recognized, so there is nothing to fetch
+                 me.info(['uploadId ', me.uploadId, ' does not exist.'].join(''));
+                 removeUploadFile();
+                 monitorProgress();
+                 makeParts();
+                 processPartsList();
+              } else {
+                 var msg = 'Error listing parts for getUploadParts() starting at part # ' + partNumberMarker;
+                 l.w(msg);
+                 me.error(msg);
+              }
+           };
+
+           list.on200 = function (xhr) {
+              me.info(['uploadId ', me.uploadId, ' is not complete. Fetching parts from part marker=', partNumberMarker].join(''));
+              var oDOM = parseXml(xhr.responseText),
+                  listPartsResult = oDOM.getElementsByTagName("ListPartsResult")[0],
+                  isTruncated = nodeValue(listPartsResult, "IsTruncated") === 'true',
+                  uploadedParts = oDOM.getElementsByTagName("Part"),
+                  uploadedPart,
+                  parts_len = uploadedParts.length,
+                  cp;
+
+              for (var i = 0; i < parts_len; i++) {
+                 cp = uploadedParts[i];
+                 completedParts.push({
+                    eTag: nodeValue(cp, "ETag"),
+                    partNumber: parseInt(nodeValue(cp, "PartNumber")),
+                    size: parseInt(nodeValue(cp, "Size")),
+                    LastModified: nodeValue(cp, "LastModified")
+                 })
+              }
+
+              oDOM = uploadedParts = null; // We don't need these potentially large object any longer
+
+              if (isTruncated) {
+                 var nextPartNumberMarker = nodeValue(listPartsResult, "NextPartNumberMarker");
+                 getUploadParts(nextPartNumberMarker); // let's fetch the next set of parts
+              } else {
+                 makeParts();
+                 completedParts.forEach(function (cp) {
+                    uploadedPart = makePart(cp.partNumber, COMPLETE, cp.size);
+                    uploadedPart.eTag = cp.eTag;
+                    uploadedPart.attempts = 1;
+                    uploadedPart.loadedBytes = cp.size;
+                    uploadedPart.loadedBytesPrevious = cp.size;
+                    uploadedPart.finishedUploadingAt = cp.LastModified;
+                    uploadedPart.md5_digest = 'n/a';
+                    parts[cp.partNumber] = uploadedPart;
+                 });
+                 monitorProgress();
+                 processFileParts();
+              }
+              listPartsResult = null;  // We don't need these potentially large object any longer
+           };
+
+           setupRequest(list);
+           authorizedSend(list);
+        }
+
+        function makeParts(){
+
+           numParts = Math.ceil(me.file.size / con.partSize) || 1; // issue #58
+           for (var part = 1; part <= numParts; part++){
+              var status = (typeof parts[part] === 'undefined') ? PENDING : parts[part].status;
+
+              if (status !== COMPLETE) {
+                 parts[part] = makePart(part, PENDING, me.file.size);
+              }
+           }
+        }
+
+        function makePart(partNumber, status, size) {
+           return {
+              status: status,
+              start: (partNumber - 1) * con.partSize,
+              end: partNumber * con.partSize,
+              attempts: 0,
+              loadedBytes: 0,
+              loadedBytesPrevious: null,
+              isEmpty: (size === 0), // issue #58
+              md5_digest: null,
+              part: partNumber
+           };
+        }
+
+        function createUploadFile() {
+           var fileKey = uploadKey(me),
+               newUpload = {
+                 awsKey: me.name,
+                 uploadId: me.uploadId,
+                 fileSize: me.file.size,
+                 fileType: me.file.type,
+                 lastModifiedDate: me.file.lastModifiedDate.toISOString(),
+                 partSize: con.partSize,
+                 createdAt: new Date().toISOString()
+              };
+           if (con.computeContentMd5 && parts.length && typeof parts[1].md5_digest !== 'undefined') {
+              newUpload.firstMd5Digest = parts[1].md5_digest;
+           }
+           saveUpload(fileKey, newUpload);
+        }
+
+        function completeUploadFile() {
+           var uploads = getSavedUploads(),
+               upload = uploads[uploadKey(me)];
+           upload.completedAt = new Date().toISOString();
+           upload.eTag = me.eTag;
+           localStorage.setItem('awsUploads', JSON.stringify(uploads));
+
+           setStatus(COMPLETE);
+           me.progress(1.0);
+
+        }
+
+        function removeUploadFile() {
+           if (typeof me.file !== 'undefined') {
+              removeUpload(uploadKey(me));
+           }
+        }
+
+        function getUnfinishedFileUpload() {
+           var savedUploads = getSavedUploads(true),
+               u = savedUploads[uploadKey(me)];
+
+           if (canRetryUpload(u)) {
+              me.uploadId = u.uploadId;
+              me.name = u.awsKey;
+              me.eTag = u.eTag;
+              me.firstMd5Digest = u.firstMd5Digest;
+           }
+        }
+
+        function canRetryUpload(u) {
+           // Must be the same file name, file size, last_modified, file type and the part sizes must match
+           if (typeof u === 'undefined') {
+              return false;
+           }
+           var completedAt = new Date(u.completedAt || FAR_FUTURE);
+
+           return con.partSize === u.partSize && completedAt > HOURS_AGO;
+        }
+
+        function backOffWait(attempts) {
+           return (attempts === 1) ? 0 : 1000 * Math.min(
+               con.maxRetryBackoffSecs,
+               Math.pow(con.retryBackoffPower, attempts - 2)
+           );
+        }
 
         function processPartsList(){
 
@@ -460,11 +858,14 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
               return;
            }
 
-           parts.forEach(function(part,i){
-
-              var requiresUpload = false;
-              stati.push(part.status);
-              if (part){
+           for (var i = 0; i < parts.length; i++) {
+              var part = parts[i];
+              if (part) {
+                 if (con.computeContentMd5 && part.md5_digest === null) {
+                    return; // MD5 Digest isn't ready yet
+                 }
+                 var requiresUpload = false;
+                 stati.push(part.status);
                  switch(part.status){
 
                     case EVAPORATING:
@@ -494,7 +895,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
                     }
                  }
               }
-           });
+           }
 
 
            info = stati.toString() + ' // bytesLoaded: ' + bytesLoaded.toString();
@@ -528,7 +929,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         /*
            Issue #6 identified that some parts would stall silently.
            The issue was only noted on Safari on OSX. A bug was filed with Apple, #16136393
-           This function was addeded as a work-around. It check the progress of each part every 2 minutes.
+           This function was added as a work-around. It checks the progress of each part every 2 minutes.
            If it finds a part that has made no progress in the last 2 minutes then it aborts it. It will then be detected as an error, and restarted in the same manner of any other errored part
         */
         function monitorPartsProgress(){
@@ -572,6 +973,10 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
            },2 * 60 * 1000);
         }
 
+        function monitorProgress() {
+           monitorTotalProgress();
+           monitorPartsProgress();
+        }
 
         function setupRequest(requester){
 
@@ -583,7 +988,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
            }
            else
            {
-               var xmlHttpRequest = new XMLHttpRequest(); 
+               var xmlHttpRequest = new XMLHttpRequest();
 
                xmlHttpRequest.open("GET", con.timeUrl + '?requestTime=' + new Date().getTime(), false);
                xmlHttpRequest.send();
@@ -596,12 +1001,20 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
            requester.onGotAuth = function (){
 
-              var xhr = new XMLHttpRequest();
-              xhrs.push(xhr);
-              requester.awsXhr = xhr;
+              if (hasCurrentXhr(requester)) {
+                 l.w('onGotAuth() step', requester.step, 'is already in progress. Returning.');
+                 return;
+              }
+
+              var xhr = assignCurrentXhr(requester);
+
               var payload = requester.toSend ? requester.toSend() : null;
               var url = AWS_URL + requester.path;
+              if (requester.query_string) {
+                 url += requester.query_string;
+              }
               var all_headers = {};
+              var status_success = requester.successStatus || 200;
               extend(all_headers, requester.not_signed_headers);
               extend(all_headers, requester.x_amz_headers);
 
@@ -623,12 +1036,16 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
                  xhr.setRequestHeader('Content-Type', requester.contentType);
               }
 
+              if (requester.md5_digest) {
+                 xhr.setRequestHeader('Content-MD5', requester.md5_digest);
+              }
               xhr.onreadystatechange = function(){
 
                  if (xhr.readyState == 4){
 
                     if(payload){l.d('  ### ' + payload.size);} // Test, per http://code.google.com/p/chromium/issues/detail?id=167111#c20
-                    if (xhr.status == 200){
+                    clearCurrentXhr(requester);
+                    if (xhr.status == status_success) {
                        requester.on200(xhr);
                     } else {
                        requester.onErr(xhr);
@@ -636,7 +1053,10 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
                  }
               };
 
-              xhr.onerror = function(){requester.onErr(xhr,true);};
+              xhr.onerror = function(){
+                 clearCurrentXhr(requester);
+                 requester.onErr(xhr, true);
+              };
 
               if (typeof requester.onProgress == 'function'){
                  xhr.upload.onprogress = function(evt){
@@ -657,9 +1077,12 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         function authorizedSend(authRequester){
 
            l.d('authorizedSend() ' + authRequester.step);
-           var xhr = new XMLHttpRequest();
-           xhrs.push(xhr);
-           authRequester.authXhr = xhr;
+           if (hasCurrentXhr(authRequester)) {
+              l.w('authorizedSend() step', authRequester.step, 'is already in progress. Returning.');
+              return;
+           }
+
+           var xhr = assignCurrentXhr(authRequester);
            var url = con.signerUrl+'?to_sign='+makeStringToSign(authRequester);
            var warnMsg;
 
@@ -680,12 +1103,15 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
                     l.d('authorizedSend got signature for step: \'' + authRequester.step + '\'    sig: '+ xhr.response);
                     authRequester.auth = xhr.response;
+                    clearCurrentXhr(authRequester);
                     authRequester.onGotAuth();
 
                  } else {
+
                     warnMsg = 'failed to get authorization (readyState=4) for ' + authRequester.step + '.  xhr.status: ' + xhr.status + '.  xhr.response: ' + xhr.response;
                     l.w(warnMsg);
                     me.warn(warnMsg);
+                    clearCurrentXhr(authRequester);
                     authRequester.onFailedAuth(xhr);
                  }
               }
@@ -729,9 +1155,8 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
               x_amz_headers += (header_key + ':'+ request.x_amz_headers[header_key] + '\n');
            });
 
-
            to_sign = request.method+'\n'+
-              '\n'+
+              (request.md5_digest || '')+'\n'+
               (request.contentType || '')+'\n'+
               '\n'+
               x_amz_headers +
@@ -748,6 +1173,22 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
          return path;
        }
 
+        function getBaseXhrObject(requester) {
+           // The Xhr is either on the upload or on a part...
+           return (typeof requester.part === 'undefined') ? requester : requester.part;
+        }
+
+        function hasCurrentXhr(requester) {
+           return !!getBaseXhrObject(requester).currentXhr;
+        }
+
+        function assignCurrentXhr(requester) {
+           return getBaseXhrObject(requester).currentXhr =  new XMLHttpRequest();
+        }
+
+        function clearCurrentXhr(requester) {
+           delete getBaseXhrObject(requester).currentXhr;
+        }
      }
 
 
@@ -767,7 +1208,64 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         return obj1;
      }
 
+     function parseXml(body) {
+        var parser = new DOMParser();
+        return parser.parseFromString(body, "text/xml");
+     }
+
+     function getSavedUploads(purge) {
+        var result = JSON.parse(localStorage.getItem('awsUploads') || '{}'),
+            new_result = {};
+
+        if (purge) {
+           for (var key in result) {
+              if (result.hasOwnProperty(key)) {
+                 var upload = result[key],
+                     completedAt = new Date(upload.completedAt || FAR_FUTURE);
+
+                 if (completedAt < HOURS_AGO) {
+                    // The upload is recent, let's keep it
+                    delete result[key];
+                 }
+              }
+           }
+        }
+        return result;
+     }
+
+     function uploadKey(fileUpload) {
+        // The key tries to give a signature to a file in the absence of its path.
+        // "<filename>-<mimetype>-<modifieddate>-<filesize>"
+        return [
+           fileUpload.file.name,
+           fileUpload.file.type,
+           fileUpload.file.lastModifiedDate.toISOString(),
+           fileUpload.file.size
+        ].join("-");
+     }
+
+     function saveUpload(uploadKey, upload) {
+        var uploads = getSavedUploads();
+        uploads[uploadKey] = upload;
+        localStorage.setItem('awsUploads', JSON.stringify(uploads));
+     }
+
+     function removeUpload(uploadKey) {
+        var uploads = getSavedUploads();
+        delete uploads[uploadKey];
+        localStorage.setItem('awsUploads', JSON.stringify(uploads));
+     }
+
+     function nodeValue(parent, nodeName) {
+        return parent.getElementsByTagName(nodeName)[0].childNodes[0].nodeValue
+     }
   };
+
+   function getFilePart(file, start, end) {
+      var slicerFn = (file.slice ? 'slice' : (file.mozSlice ? 'mozSlice' : 'webkitSlice'));
+      // browsers' implementation of the Blob.slice function has been renamed a couple of times, and the meaning of the 2nd parameter changed. For example Gecko went from slice(start,length) -> mozSlice(start, end) -> slice(start, end). As of 12/12/12, it seems that the unified 'slice' is the best bet, hence it being first in the list. See https://developer.mozilla.org/en-US/docs/DOM/Blob for more info.
+      return file[slicerFn](start, end);
+   }
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = Evaporate;

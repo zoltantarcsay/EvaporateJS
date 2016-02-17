@@ -16,6 +16,12 @@ This is an beta release. It still needs lots more work and testing, but we do us
 
      <script language="javascript" type="text/javascript" src="../evaporate.js"></script>
 
+2. If you want to compute an MD5 digest for AWS, then make sure to include your preferred javascript
+cryptography library that supports creating an MD5 digest for the Content-MD5 request header as
+specified [here](https://www.ietf.org/rfc/rfc1864.txt). The following library provides support:
+
+     - [Spark MD5](https://github.com/satazor/SparkMD5)
+
 2. Setup your S3 bucket, make sure your CORS settings for your S3 bucket looks similar to what is provided below (The PUT allowed method and the ETag exposed header are critical).
 
         <CORSConfiguration>
@@ -25,6 +31,8 @@ This is an beta release. It still needs lots more work and testing, but we do us
                 <AllowedMethod>PUT</AllowedMethod>
                 <AllowedMethod>POST</AllowedMethod>
                 <AllowedMethod>DELETE</AllowedMethod>
+                <AllowedMethod>GET</AllowedMethod>
+                <AllowedMethod>HEAD</AllowedMethod>
                 <ExposeHeader>ETag</ExposeHeader>
                 <AllowedHeader>*</AllowedHeader>
             </CORSRule>
@@ -86,12 +94,19 @@ So far the api contains just two methods, and one property
 * **logging**: default=true, whether EvaporateJS outputs to the console.log  - should be `true` or `false`
 * **maxConcurrentParts**: default=5, how many concurrent file PUTs will be attempted
 * **partSize**: default = 6 * 1024 * 1024 bytes, the size of the parts into which the file is broken
-* **retryBackoffPower**: default=2, how aggresively to back-off on the delay between retries of a part PUT
+* **retryBackoffPower**: default=2, how aggressively to back-off on the delay between retries of a part PUT
 * **maxRetryBackoffSecs**: default=20, the maximum number of seconds to wait between retries 
 * **progressIntervalMS**: default=1000, the frequency (in milliseconds) at which progress events are dispatched
 * **aws_url**: default='https://s3.amazonaws.com', the S3 endpoint URL
 * **cloudfront**: default=false, whether to format upload urls to upload via CloudFront. Usually requires aws_url to be something other than the default
 * **timeUrl',**: default=undefined, a url on your application server which will return a DateTime. for example '/sign_auth/time' and return a RF 2616 Date (http://www.w3.org/Protocols/rfc2616/rfc2616-sec3.html) e.g. "Tue, 01 Jan 2013 04:39:43 GMT".  See https://github.com/TTLabs/EvaporateJS/issues/74
+* **computeContentMd5',**: default=false, whether to compute and send an MD5 digest for each part for verification by AWS S3.,
+* **cryptoMd5Method',**: default=undefined, a method that computes the MD5 digest according to https://www.ietf.org/rfc/rfc1864.txt. Only applicable when `computeContentMd5` is set.
+    Method signature is `function (data) { return 'computed MD5 digest of data'; }` where `data` is a JavaScript binary string representation of the body payload to encode. If you are using:
+    - Spark MD5, the method would look like this: `function (data) { return btoa(SparkMD5.hashBinary(data, true)); }`.
+* **s3FileCacheHoursAgo',**: default=no cache, whether to use the S3 uploaded cache of parts and files for ease of recovering after
+    client failure or page refresh. The value should be a whole number representing the number of hours ago to check for uploaded parts
+    and files. The uploaded parts and and file status are retrieved from S3.
 
 ### .add()
 
@@ -111,7 +126,7 @@ So far the api contains just two methods, and one property
 
 * **signParams**: _Object_. an object of key/value pairs that will be passed to _all_ calls to the signerUrl. 
 
-* **complete**: _function()_. a function that will be called when the file upload is complete.
+* **complete**: _function(xhr, awsKey)_. a function that will be called when the file upload is complete.
  
 * **cancelled**: _function()_.  a function that will be called when a successful cancel is called for an upload id.
 
@@ -134,6 +149,21 @@ So far the api contains just two methods, and one property
 
 The `supported` property is _Boolean_, and indicates whether the browser has the capabilities required for Evaporate to work. Needs more testing.  
 
+### s3FileCacheHoursAgo
+
+When `s3FileCacheHoursAgo` is enabled, the uploader will create a small footprint of the uploaded file in `localStorage`. Before a
+file is uploaded, this cache is queried by file name (the path is not available to browsers). It then verifies that the `partSize` used
+when uploading matches the current partSize; the file size is the same; the file lastModifiedDate is unchanged and the file mime type is the
+same.
+
+If the uploaded file has an unfinished multipart upload ID associated with it, then S3 is queried for the parts that have been uploaded and
+only uploads the parts that are outstanding.
+
+If the uploaded file has no open multipart upload, then the ETag of the last time the file was uploaded to S3 is compared to the Etag of
+what is currently uploaded. If the the two ETags match, the file is not uploaded again.
+
+The timestamp of the last time the part was uploaded is compared against the value of a `Date()` calculated as `s3FileCacheHoursAgo` ago
+as a way to gauge 'freshness'. If the last upload was earlier than the number of hours specified, then the file is uploaded again.
 
 ## Integration
 
