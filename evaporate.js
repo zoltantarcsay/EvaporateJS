@@ -75,7 +75,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         if (typeof file.name == 'undefined'){
            err = 'Missing attribute: name  ';
         } else if(con.encodeFilename) {
-           file.name = encodeURIComponent(file.name); // prevent signature fail in case file name has spaces 
+           file.name = encodeURIComponent(file.name); // prevent signature fail in case file name has spaces
         }
 
         /*if (!(file.file instanceof File)){
@@ -251,7 +251,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         me.pause = function (){
           l.d('Paused FileUpload ', me.id);
           setStatus(PAUSED);
-          cancelAllRequests();
+           abortAllParts(PAUSED);
         };
 
         me.resume = function  () {
@@ -272,14 +272,22 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         }
 
 
-        function cancelAllRequests(){
+        function cancelAllRequests() {
            l.d('cancelAllRequests()');
+
+           abortAllParts();
+           abortUpload();
+        }
+
+        function abortAllParts(status) {
+           l.d('abortAllParts()');
 
            for (var i = 1; i < parts.length; i++) {
               abortPart(i, true);
+              if (status) {
+                parts[i].status = status;
+              }
            }
-
-           abortUpload();
         }
 
 
@@ -426,7 +434,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
               var eTag = xhr.getResponseHeader('ETag'), msg;
               l.d('uploadPart 200 response for part #' + partNumber + '     ETag: ' + eTag);
               if(part.isEmpty || (eTag != ETAG_OF_0_LENGTH_BLOB)) // issue #58
-              { 
+              {
                  part.eTag = eTag;
                  part.status = COMPLETE;
               }
@@ -485,6 +493,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
                  part.currentXhr.onreadystatechange = function () {};
               }
               part.currentXhr.abort();
+              part.currentXhr = null;
            }
         }
 
@@ -902,7 +911,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
                        requiresUpload = true;
                        break;
 
-                    case PENDING:
+                    case PENDING: case PAUSED:
                        requiresUpload = true;
                        break;
 
@@ -1015,9 +1024,9 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
                xmlHttpRequest.open("GET", con.timeUrl + '?requestTime=' + new Date().getTime(), false);
                xmlHttpRequest.send();
-               requester.dateString = xmlHttpRequest.responseText;               
+               requester.dateString = xmlHttpRequest.responseText;
            }
-           
+
            requester.x_amz_headers = extend(requester.x_amz_headers,{
               'x-amz-date': requester.dateString
            });
